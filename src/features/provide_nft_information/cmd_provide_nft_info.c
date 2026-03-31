@@ -1,30 +1,32 @@
+#include "read.h"
+#include "app_mem_utils.h"
 #include "apdu_constants.h"
 #include "asset_info.h"
 #include "network.h"
 #include "public_keys.h"
-#include "manage_asset_info.h"
 #include "os_pki.h"
-
-#define TYPE_SIZE        1
-#define VERSION_SIZE     1
-#define NAME_LENGTH_SIZE 1
-#define HEADER_SIZE      (TYPE_SIZE + VERSION_SIZE + NAME_LENGTH_SIZE)
-
-#define CHAIN_ID_SIZE         8
-#define KEY_ID_SIZE           1
-#define ALGORITHM_ID_SIZE     1
-#define SIGNATURE_LENGTH_SIZE 1
-#define MIN_DER_SIG_SIZE      67
-#define MAX_DER_SIG_SIZE      72
+#include "nft_info.h"
 
 #define STAGING_NFT_METADATA_KEY 0
 #define PROD_NFT_METADATA_KEY    1
+#ifdef HAVE_NFT_STAGING_KEY
+#define KEY_ID STAGING_NFT_METADATA_KEY
+#else
+#define KEY_ID PROD_NFT_METADATA_KEY
+#endif
 
 #define ALGORITHM_ID_1 1
 
 #define TYPE_1 1
 
 #define VERSION_1 1
+
+typedef struct {
+    flist_node_t _list;
+    s_nft_info info;
+} s_nft_info_node;
+
+static s_nft_info_node *g_nft_info_list;
 
 /**
  * Handle the APDU command that provides NFT collection metadata to the app.
@@ -47,129 +49,124 @@
  *   that subsequent commands (for example, transaction signing) can display
  *   or otherwise use the NFT collection information.
  *
- * @param workBuffer  Pointer to the APDU data buffer containing the NFT
+ * @param lc  Length of the data available in payload.
+ * @param data  Pointer to the APDU data buffer containing the NFT
  *                    metadata payload to be parsed and verified.
- * @param dataLength  Length of the data available in workBuffer.
  * @param tx          Pointer to the variable that will hold the number of
  *                    bytes written to the APDU response buffer.
  *
  * @return SW_OK on success, or an ISO7816-style status word describing the
  *         validation or parsing error encountered.
  */
-uint16_t handle_provide_nft_information(const uint8_t *workBuffer,
-                                        uint8_t dataLength,
+uint16_t handle_provide_nft_information(uint8_t p1,
+                                        uint8_t p2,
+                                        uint8_t lc,
+                                        const uint8_t *data,
                                         unsigned int *tx) {
-    uint8_t hash[INT256_LENGTH];
-    nftInfo_t *nft = NULL;
+    s_nft_info_node *node;
+    uint8_t hash[CX_SHA256_SIZE];
     size_t offset = 0;
-    size_t payloadSize = 0;
-    uint8_t collectionNameLength = 0;
-    uint64_t chain_id = 0;
-    uint8_t signatureLen = 0;
-#ifdef HAVE_NFT_STAGING_KEY
-    uint8_t valid_keyId = STAGING_NFT_METADATA_KEY;
-#else
-    uint8_t valid_keyId = PROD_NFT_METADATA_KEY;
-#endif
+    uint8_t type;
+    uint8_t version;
+    uint8_t collection_name_length;
+    const char *collection_name;
+    const uint8_t *address;
+    uint64_t chain_id;
+    uint8_t key_id;
+    uint8_t algo_id;
+    uint8_t sig_length;
+    const uint8_t *sig;
+    uint8_t index = 0;
 
-    PRINTF("In handle provide NFTInformation\n");
+    if ((p1 != 0) || (p2 != 0)) {
+        return SWO_INCORRECT_P1_P2;
+    }
 
-    nft = &get_current_asset_info()->nft;
+    if ((offset + sizeof(type)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    type = data[offset];
+    offset += sizeof(type);
 
-    PRINTF("Provisioning currentAssetIndex %d\n", tmpCtx.transactionContext.currentAssetIndex);
+    if ((offset + sizeof(version)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    version = data[offset];
+    offset += sizeof(version);
 
-    if (dataLength <= HEADER_SIZE) {
-        PRINTF("Data too small for headers: expected at least %d, got %d\n",
-               HEADER_SIZE,
-               dataLength);
+    if ((offset + sizeof(collection_name_length)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    collection_name_length = data[offset];
+    offset += sizeof(collection_name_length);
+
+    if ((offset + collection_name_length) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    collection_name = (const char *) &data[offset];
+    offset += collection_name_length;
+
+    if ((offset + sizeof(node->info.address)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    address = &data[offset];
+    offset += sizeof(node->info.address);
+
+    if ((offset + sizeof(chain_id)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    chain_id = read_u64_be(data, offset);
+    offset += sizeof(chain_id);
+
+    if ((offset + sizeof(key_id)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    key_id = data[offset];
+    offset += sizeof(key_id);
+
+    if ((offset + sizeof(algo_id)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    algo_id = data[offset];
+    offset += sizeof(algo_id);
+
+    cx_hash_sha256(data, offset, hash, sizeof(hash));
+
+    if ((offset + sizeof(sig_length)) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    sig_length = data[offset];
+    offset += sizeof(sig_length);
+
+    if ((offset + sig_length) > lc) {
+        return SWO_INCORRECT_DATA;
+    }
+    sig = &data[offset];
+    offset += sig_length;
+
+    // check for unexpected  extra data
+    if (offset != lc) {
         return SWO_INCORRECT_DATA;
     }
 
-    if (workBuffer[offset] != TYPE_1) {
-        PRINTF("Unsupported type %d\n", workBuffer[offset]);
+    // sanity checks
+    if (type != TYPE_1) {
         return SWO_INCORRECT_DATA;
     }
-    offset += TYPE_SIZE;
-
-    if (workBuffer[offset] != VERSION_1) {
-        PRINTF("Unsupported version %d\n", workBuffer[offset]);
+    if (version != VERSION_1) {
         return SWO_INCORRECT_DATA;
     }
-    offset += VERSION_SIZE;
-
-    collectionNameLength = workBuffer[offset];
-    offset += NAME_LENGTH_SIZE;
-
-    // Size of the payload (everything except the signature)
-    payloadSize = HEADER_SIZE + collectionNameLength + ADDRESS_LENGTH + CHAIN_ID_SIZE +
-                  KEY_ID_SIZE + ALGORITHM_ID_SIZE;
-    if (dataLength < payloadSize) {
-        PRINTF("Data too small for payload: expected at least %d, got %d\n",
-               payloadSize,
-               dataLength);
+    if ((collection_name_length + 1) > sizeof(node->info.collection_name)) {
         return SWO_INCORRECT_DATA;
     }
-
-    if (collectionNameLength > COLLECTION_NAME_MAX_LEN) {
-        PRINTF("CollectionName too big: expected max %d, got %d\n",
-               COLLECTION_NAME_MAX_LEN,
-               collectionNameLength);
-        return SWO_INCORRECT_DATA;
-    }
-
-    // Safe because we've checked the size before.
-    memcpy(nft->collectionName, workBuffer + offset, collectionNameLength);
-    nft->collectionName[collectionNameLength] = '\0';
-
-    PRINTF("Length: %d\n", collectionNameLength);
-    PRINTF("CollectionName: %s\n", nft->collectionName);
-    offset += collectionNameLength;
-
-    memcpy(nft->contractAddress, workBuffer + offset, ADDRESS_LENGTH);
-    PRINTF("Address: %.*H\n", ADDRESS_LENGTH, workBuffer + offset);
-    offset += ADDRESS_LENGTH;
-
-    chain_id = u64_from_BE(workBuffer + offset, CHAIN_ID_SIZE);
-    PRINTF("ChainID: %llu\n", chain_id);
     if (!app_compatible_with_chain_id(&chain_id)) {
         UNSUPPORTED_CHAIN_ID_MSG(chain_id);
         return SWO_INCORRECT_DATA;
     }
-    offset += CHAIN_ID_SIZE;
-
-    if (workBuffer[offset] != valid_keyId) {
-        PRINTF("Unsupported KeyID %d\n", workBuffer[offset]);
+    if (key_id != KEY_ID) {
         return SWO_INCORRECT_DATA;
     }
-    offset += KEY_ID_SIZE;
-
-    if (workBuffer[offset] != ALGORITHM_ID_1) {
-        PRINTF("Incorrect algorithmId %d\n", workBuffer[offset]);
-        return SWO_INCORRECT_DATA;
-    }
-    offset += ALGORITHM_ID_SIZE;
-
-    PRINTF("hashing: %.*H\n", payloadSize, workBuffer);
-    cx_hash_sha256(workBuffer, payloadSize, hash, sizeof(hash));
-
-    if (dataLength < payloadSize + SIGNATURE_LENGTH_SIZE) {
-        PRINTF("Data too short to hold signature length\n");
-        return SWO_INCORRECT_DATA;
-    }
-
-    signatureLen = workBuffer[offset];
-    PRINTF("Signature len: %d\n", signatureLen);
-    if (signatureLen < MIN_DER_SIG_SIZE || signatureLen > MAX_DER_SIG_SIZE) {
-        PRINTF("SignatureLen too big or too small. Must be between %d and %d, got %d\n",
-               MIN_DER_SIG_SIZE,
-               MAX_DER_SIG_SIZE,
-               signatureLen);
-        return SWO_INCORRECT_DATA;
-    }
-    offset += SIGNATURE_LENGTH_SIZE;
-
-    if (dataLength < payloadSize + SIGNATURE_LENGTH_SIZE + signatureLen) {
-        PRINTF("Signature could not fit in data\n");
+    if (algo_id != ALGORITHM_ID_1) {
         return SWO_INCORRECT_DATA;
     }
 
@@ -178,13 +175,45 @@ uint16_t handle_provide_nft_information(const uint8_t *workBuffer,
                                     LEDGER_NFT_METADATA_PUBLIC_KEY,
                                     sizeof(LEDGER_NFT_METADATA_PUBLIC_KEY),
                                     CERTIFICATE_PUBLIC_KEY_USAGE_NFT_METADATA,
-                                    (uint8_t *) (workBuffer + offset),
-                                    signatureLen) != true) {
+                                    sig,
+                                    sig_length) != true) {
         return SWO_INCORRECT_DATA;
     }
 
-    G_io_tx_buffer[0] = tmpCtx.transactionContext.currentAssetIndex;
-    validate_current_asset_info();
+    // look for an existing matching node
+    for (node = g_nft_info_list; node != NULL;
+         node = (s_nft_info_node *) ((flist_node_t *) node)->next) {
+        if (chain_id == node->info.chain_id) {
+            if (memcmp(address, node->info.address, sizeof(node->info.address)) == 0) {
+                break;
+            }
+        }
+        index += 1;
+    }
+
+    if (node == NULL) {
+        if ((node = APP_MEM_ALLOC(sizeof(*node))) == NULL) {
+            return SWO_INSUFFICIENT_MEMORY;
+        }
+        explicit_bzero(node, sizeof(*node));
+
+        memcpy(node->info.address, address, sizeof(node->info.address));
+        node->info.chain_id = chain_id;
+        flist_push_back((flist_node_t **) &g_nft_info_list, (flist_node_t *) node);
+    }
+
+    memcpy(node->info.collection_name, collection_name, collection_name_length);
+    node->info.collection_name[collection_name_length] = '\0';
+
+    G_io_tx_buffer[0] = index;
     *tx += 1;
     return SWO_SUCCESS;
+}
+
+static void delete_nft_info(s_nft_info_node *node) {
+    APP_MEM_FREE(node);
+}
+
+void clear_nft_infos(void) {
+    flist_clear((flist_node_t **) &g_nft_info_list, (f_list_node_del) &delete_nft_info);
 }
