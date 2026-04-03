@@ -1,4 +1,5 @@
 #include "apdu_constants.h"
+#include "tlv_use_case_dynamic_descriptor.h"
 #include "public_keys.h"
 #include "network.h"
 #include "os_pki.h"
@@ -50,7 +51,7 @@ static bool erc20_token_info_common(uint64_t *chain_id,
     return true;
 }
 
-static uint16_t erc20_token_info_handler(uint8_t lc, const uint8_t *data, unsigned int *tx) {
+static uint16_t erc20_token_info_handler_legacy(uint8_t lc, const uint8_t *data, unsigned int *tx) {
     uint32_t offset = 0;
     s_token_info_node *node;
     uint8_t ticker_length;
@@ -130,6 +131,46 @@ static uint16_t erc20_token_info_handler(uint8_t lc, const uint8_t *data, unsign
     return SWO_SUCCESS;
 }
 
+typedef struct {
+    TLV_reception_t received_tags;
+    uint64_t chain_id;
+    buffer_t address;
+} s_tuid_ctx;
+
+static bool handle_tuid_chain_id(const tlv_data_t *data, s_tuid_ctx *out) {
+    return get_uint64_t_from_tlv_data(data, &out->chain_id);
+}
+
+static bool handle_tuid_address(const tlv_data_t *data, s_tuid_ctx *out) {
+    return get_buffer_from_tlv_data(data, &out->address, 1, ADDRESS_LENGTH);
+}
+
+#define TUID_TLV_TAGS(X)                                            \
+    X(0x23, TAG_CHAIN_ID, handle_tuid_chain_id, ENFORCE_UNIQUE_TAG) \
+    X(0x22, TAG_ADDRESS, handle_tuid_address, ENFORCE_UNIQUE_TAG)
+
+DEFINE_TLV_PARSER(TUID_TLV_TAGS, NULL, parse_dynamic_token_tuid);
+
+static uint16_t erc20_token_info_handler(uint8_t lc, const uint8_t *data, unsigned int *tx) {
+    const buffer_t buf = {.ptr = (uint8_t *) data, .size = lc, .offset = 0};
+    tlv_dynamic_descriptor_out_t tlv_output = {0};
+    if (tlv_use_case_dynamic_descriptor(&buf, &tlv_output) != TLV_DYNAMIC_DESCRIPTOR_SUCCESS) {
+        return SWO_INCORRECT_DATA;
+    }
+
+    // sanity checks
+    if (tlv_output.coin_type != 60) {
+        return SWO_INCORRECT_DATA;
+    }
+
+    // parse TUID
+    s_tuid_ctx out = {0};
+    if (!parse_dynamic_token_tuid(&tlv_output.TUID, &out, &out.received_tags)) {
+        return SWO_INCORRECT_DATA;
+    }
+    return SWO_SUCCESS;
+}
+
 uint16_t handle_provide_erc20_token_information(uint8_t p1,
                                                 uint8_t p2,
                                                 uint8_t lc,
@@ -138,6 +179,8 @@ uint16_t handle_provide_erc20_token_information(uint8_t p1,
     if (p2 == 0) {
         switch (p1) {
             case 0:
+                return erc20_token_info_handler_legacy(lc, data, tx);
+            case 1:
                 return erc20_token_info_handler(lc, data, tx);
             default:
                 break;
