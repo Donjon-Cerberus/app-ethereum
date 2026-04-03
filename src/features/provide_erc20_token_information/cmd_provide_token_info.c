@@ -13,11 +13,44 @@ typedef struct {
 
 static s_token_info_node *g_token_info_list;
 
-uint16_t handle_provide_erc20_token_information(uint8_t p1,
-                                                uint8_t p2,
-                                                uint8_t lc,
-                                                const uint8_t *data,
-                                                unsigned int *tx) {
+static bool erc20_token_info_common(uint64_t *chain_id,
+                                    const uint8_t *address,
+                                    size_t ticker_length,
+                                    const char *ticker,
+                                    uint8_t decimals,
+                                    uint8_t *index) {
+    s_token_info_node *node;
+
+    *index = 0;
+    // look for an existing matching node
+    for (node = g_token_info_list; node != NULL;
+         node = (s_token_info_node *) ((flist_node_t *) node)->next) {
+        if (*chain_id == node->info.chain_id) {
+            if (memcmp(address, node->info.address, sizeof(node->info.address)) == 0) {
+                break;
+            }
+        }
+        *index += 1;
+    }
+
+    if (node == NULL) {
+        if ((node = APP_MEM_ALLOC(sizeof(*node))) == NULL) {
+            return false;
+        }
+        explicit_bzero(node, sizeof(*node));
+
+        memcpy(node->info.address, address, sizeof(node->info.address));
+        node->info.chain_id = *chain_id;
+        flist_push_back((flist_node_t **) &g_token_info_list, (flist_node_t *) node);
+    }
+
+    memcpy(node->info.ticker, ticker, ticker_length);
+    node->info.ticker[ticker_length] = '\0';
+    node->info.decimals = decimals;
+    return true;
+}
+
+static uint16_t erc20_token_info_handler(uint8_t lc, const uint8_t *data, unsigned int *tx) {
     uint32_t offset = 0;
     s_token_info_node *node;
     uint8_t ticker_length;
@@ -27,11 +60,8 @@ uint16_t handle_provide_erc20_token_information(uint8_t p1,
     uint32_t chain_id_32;
     uint64_t chain_id;
     uint8_t hash[INT256_LENGTH];
-    uint8_t index = 0;
+    uint8_t index;
 
-    if ((p1 != 0) || (p2 != 0)) {
-        return SWO_INCORRECT_P1_P2;
-    }
     if ((offset + sizeof(ticker_length)) > lc) {
         return SWO_INCORRECT_DATA;
     }
@@ -91,35 +121,29 @@ uint16_t handle_provide_erc20_token_information(uint8_t p1,
         return SWO_INCORRECT_DATA;
     }
 
-    // look for an existing matching node
-    for (node = g_token_info_list; node != NULL;
-         node = (s_token_info_node *) ((flist_node_t *) node)->next) {
-        if (chain_id == node->info.chain_id) {
-            if (memcmp(addr, node->info.address, sizeof(node->info.address)) == 0) {
-                break;
-            }
-        }
-        index += 1;
+    if (!erc20_token_info_common(&chain_id, addr, ticker_length, ticker, decimals, &index)) {
+        return SWO_INCORRECT_DATA;
     }
-
-    if (node == NULL) {
-        if ((node = APP_MEM_ALLOC(sizeof(*node))) == NULL) {
-            return SWO_INSUFFICIENT_MEMORY;
-        }
-        explicit_bzero(node, sizeof(*node));
-
-        memcpy(node->info.address, addr, sizeof(node->info.address));
-        node->info.chain_id = chain_id;
-        flist_push_back((flist_node_t **) &g_token_info_list, (flist_node_t *) node);
-    }
-
-    memcpy(node->info.ticker, ticker, ticker_length);
-    node->info.ticker[ticker_length] = '\0';
-    node->info.decimals = (uint8_t) decimals;
 
     G_io_tx_buffer[0] = index;
     *tx += 1;
     return SWO_SUCCESS;
+}
+
+uint16_t handle_provide_erc20_token_information(uint8_t p1,
+                                                uint8_t p2,
+                                                uint8_t lc,
+                                                const uint8_t *data,
+                                                unsigned int *tx) {
+    if (p2 == 0) {
+        switch (p1) {
+            case 0:
+                return erc20_token_info_handler(lc, data, tx);
+            default:
+                break;
+        }
+    }
+    return SWO_INCORRECT_P1_P2;
 }
 
 static void delete_token_info(s_token_info_node *node) {
